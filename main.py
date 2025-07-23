@@ -1,50 +1,64 @@
 import sys
-from awsglue.context import GlueContext
+from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
-from pyspark.sql.functions import col, lit, explode, sequence, to_date, date_format
-from pyspark.sql.types import DateType
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, lit
+from pyspark.sql.types import IntegerType
+import datetime
 
-# Parameters
-args = getResolvedOptions(sys.argv, [
-    'JOB_NAME',
-    'input_path',
-    'database_name',
-    'table_name'
-])
+# Get job parameters
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'INPUT_PATH', 'DATABASE_NAME', 'TABLE_NAME'])
 
+# Initialize Spark and Glue contexts
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
 
-input_path = args['input_path']
-database = args['database_name']
-table = args['table_name']
+def get_fridays_in_range(start_date, end_date):
+    """Generate all Fridays between two dates in YYYYMMDD format"""
+    start = datetime.datetime.strptime(start_date, "%Y%m%d")
+    end = datetime.datetime.strptime(end_date, "%Y%m%d")
+    
+    fridays = []
+    current = start
+    while current <= end:
+        if current.weekday() == 4:  # Friday
+            fridays.append(current.strftime("%Y%m%d"))
+        current += datetime.timedelta(days=1)
+    return fridays
 
-# Load CSV
-df = spark.read.option("header", "true").csv(input_path)
+def process_partition(df, ano_mes_dia):
+    """Process data for a specific partition"""
+    date = datetime.datetime.strptime(ano_mes_dia, "%Y%m%d")
+    ano_mes = date.strftime("%Y%m")
+    
+    # Filter data for the corresponding month
+    partition_data = df.filter(col("ano_mes") == int(ano_mes))
+    
+    # Add partition column
+    return partition_data.withColumn("ano_mes_dia", lit(int(ano_mes_dia)))
 
-# Convert ano_mes to date
-df = df.withColumn("ano_mes", col("ano_mes").cast("int"))
+# Read input CSV
+input_df = spark.read.option("header", "true").csv(args['INPUT_PATH'])
 
-# Create a DataFrame of Fridays from 2025-01-03 to 2025-04-04
-fridays_df = spark.sql("""
-    SELECT explode(sequence(
-        to_date('2025-01-03'), 
-        to_date('2025-04-04'), 
-        interval 1 week
-    )) as friday_date
-""").withColumn("ano_mes_dia", date_format(col("friday_date"), "yyyyMMdd").cast("int")) \
-  .withColumn("ano_mes", date_format(col("friday_date"), "yyyyMM").cast("int")) \
-  .drop("friday_date")
+# Convert ano_mes to integer
+input_df = input_df.withColumn("ano_mes", col("ano_mes").cast(IntegerType()))
 
-# Join with original data on ano_mes
-final_df = df.join(fridays_df, on="ano_mes", how="inner")
+# Get all Fridays in date range
+fridays = get_fridays_in_range("20250103", "20250404")
 
-# Write to Glue table with overwrite dynamic partition mode
-spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+# Process each partition
+for friday in fridays:
+    partition_df = process_partition(input_df, friday)
+    
+    # Write to Glue catalog with overwrite partition
+    partition_df.write.mode("overwrite").format("parquet") \
+        .option("path", f"{args['DATABASE_NAME']}/{args['TABLE_NAME']}") \
+        .partitionBy("ano_mes_dia") \
+        .saveAsTable(f"{args['DATABASE_NAME']}.{args['TABLE_NAME']}", mode="overwrite")
 
-final_df.write.mode("overwrite") \
-    .partitionBy("ano_mes_dia") \
-    .format("parquet") \
-    .saveAsTable(f"{database}.{table}")
+job.commit()
