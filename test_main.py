@@ -1,39 +1,72 @@
-import pytest
+import unittest
+from datetime import datetime, timedelta
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+import main
 
-@pytest.fixture(scope="module")
-def spark():
-    return SparkSession.builder \
-        .master("local[1]") \
-        .appName("GlueTest") \
-        .getOrCreate()
+# Initialize Spark session for testing
+spark = SparkSession.builder.appName("UnitTest").getOrCreate()
 
-def test_filter_and_partition(spark):
+def test_get_fridays_in_range():
+    # Test with a known range
+    start_date = "20250101"
+    end_date = "20250131"
+    fridays = main.get_fridays_in_range(start_date, end_date)
+    
+    # January 2025 has Fridays on 3rd, 10th, 17th, 24th, 31st
+    expected = ["20250103", "20250110", "20250117", "20250124", "20250131"]
+    assert fridays == expected, f"Expected {expected}, got {fridays}"
+    
+    # Test with a range that has no Fridays
+    start_date = "20250101"
+    end_date = "20250102"
+    fridays = main.get_fridays_in_range(start_date, end_date)
+    assert fridays == [], f"Expected empty list, got {fridays}"
+    
+    print("test_get_fridays_in_range passed")
+
+def test_process_partition():
+    # Create test data schema
+    schema = StructType([
+        StructField("sigla", StringType()),
+        StructField("squad", StringType()),
+        StructField("release_train", StringType()),
+        StructField("comunidade", StringType()),
+        StructField("diretoria", StringType()),
+        StructField("ano_mes", IntegerType())
+    ])
+    
+    # Create test data
     data = [
-        ("SP", "SQUAD1", "RT1", "COM1", "DIR1", 202501),
-        ("RJ", "SQUAD2", "RT2", "COM2", "DIR2", 202502),
-        ("MG", "SQUAD3", "RT3", "COM3", "DIR3", 202503),
-        ("BA", "SQUAD4", "RT4", "COM4", "DIR4", 202504)
+        ("A1", "Squad1", "RT1", "Com1", "Dir1", 202501),
+        ("A2", "Squad2", "RT2", "Com2", "Dir2", 202501),
+        ("B1", "Squad3", "RT3", "Com3", "Dir3", 202502)
     ]
-    schema = "sigla STRING, squad STRING, release_train STRING, comunidade STRING, diretoria STRING, ano_mes INT"
-    df = spark.createDataFrame(data, schema=schema)
+    
+    df = spark.createDataFrame(data, schema)
+    
+    # Test processing for a January date
+    jan_date = "20250103"
+    result = main.process_partition(df, jan_date)
+    
+    # Should only have January data (2 rows)
+    assert result.count() == 2, f"Expected 2 rows, got {result.count()}"
+    assert result.first()["ano_mes_dia"] == 20250103, "Incorrect partition value"
+    
+    # Test processing for a February date
+    feb_date = "20250207"
+    result = main.process_partition(df, feb_date)
+    
+    # Should only have February data (1 row)
+    assert result.count() == 1, f"Expected 1 row, got {result.count()}"
+    assert result.first()["ano_mes_dia"] == 20250207, "Incorrect partition value"
+    
+    print("test_process_partition passed")
 
-    # Create Fridays DataFrame
-    fridays_df = spark.sql("""
-        SELECT explode(sequence(
-            to_date('2025-01-03'), 
-            to_date('2025-04-04'), 
-            interval 1 week
-        )) as friday_date
-    """).withColumn("ano_mes_dia", col("friday_date").cast("date").cast("string").cast("int")) \
-      .withColumn("ano_mes", col("friday_date").cast("string").substr(1, 6).cast("int")) \
-      .drop("friday_date")
+def run_tests():
+    test_get_fridays_in_range()
+    test_process_partition()
+    spark.stop()
 
-    # Join
-    result_df = df.join(fridays_df, on="ano_mes", how="inner")
-
-    assert result_df.count() == fridays_df.count(), "Row count mismatch with Fridays"
-    assert "ano_mes_dia" in result_df.columns, "ano_mes_dia partition column missing"
-    assert result_df.select("ano_mes").distinct().count() == 4, "Missing some months"
-
+if __name__ == "__main__":
+    run_tests()
